@@ -24,6 +24,6 @@ Type ```./vtview PATH/TO/VIDEO```. Press ```ESC``` or ```Q``` to exit once the v
 + Probably lots of other stuff, but hey, first time using libav, I'm still hecking proud.
 
 # Thanks
-+[https://github.com/leandromoreira/ffmpeg-libav-tutorial](https://github.com/leandromoreira/ffmpeg-libav-tutorial)
-+[Steven Dranger's "How to write a video player in less than 1000 lines"](dranger.com/ffmpeg/)
++ [https://github.com/leandromoreira/ffmpeg-libav-tutorial](https://github.com/leandromoreira/ffmpeg-libav-tutorial)
++ [Steven Dranger's "How to write a video player in less than 1000 lines"](dranger.com/ffmpeg/)
 

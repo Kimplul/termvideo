@@ -3,7 +3,7 @@ Proof of concept command line video player written with libav/Ffmpeg and libao.
 
 # Requirements
 ## Building
-+ libao
++ PortAudio
 + Ffmpeg/libav (codec, format, swscale and swresample)
 + [my fork of termbox](https://github.com/Kimplul/termbox)
 + Linux (for now at least)

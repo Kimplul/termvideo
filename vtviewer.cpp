@@ -6,13 +6,17 @@ extern "C"
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <libavutil/eval.h>
-#include <ao/ao.h>
 }
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <array>
+#include <portaudio.h>
+#include <pthread.h>
 #include <termbox.h>
 
 // Ugly globals but they'll do for now
@@ -21,70 +25,105 @@ bool done = false;
 int frame_width = 0;
 int frame_height = 0;
 
-bool audio_ready = false;
-bool audio_decode_ready = false;
-
 SwrContext* swr_ctx;
-AVFrame* audio_frame;
-ao_device* device;
-uint8_t* audio_buffer;
-const int         out_channels = 2;
-const int         out_samples = 512;
-const int         sample_rate = 44100;
+struct SwsContext *sws_ctx = NULL;
+AVFrame           *pFrameRGB = NULL;
+AVCodecContext* video_codec_ctx = NULL;
 
-void playSound(){
-    AVFrame* laudio_frame = av_frame_alloc();
-    while(!done){
+PaStreamParameters outputParameters;
+PaStream *paStream;
+PaError err;
 
-        if(audio_decode_ready){
-            audio_decode_ready = false;
-             // Deep copy frame to make sure the decoding can take place in main
-            laudio_frame->format = audio_frame->format;
-            laudio_frame->width = audio_frame->width;
-            laudio_frame->height = audio_frame->height;
-            laudio_frame->channels = audio_frame->channels;
-            laudio_frame->channel_layout = audio_frame->channel_layout;
-            laudio_frame->nb_samples = audio_frame->nb_samples;
-            av_frame_get_buffer(laudio_frame, 1);
-            int ret = av_frame_copy(laudio_frame, audio_frame);
-            if(ret < 0){
-                exit(1);
-            }
+typedef struct LockedFrame LockedFrame;
 
-            int got_samples = swr_convert(
-                    swr_ctx,
-                    &audio_buffer, out_samples,
-                    (const uint8_t **)laudio_frame->data, laudio_frame->nb_samples);
+std::mutex init_lock;
+std::condition_variable cv;
+std::condition_variable ca;
+std::mutex cv_m;
+std::mutex ca_m;
+std::mutex video_lock;
 
-            if(got_samples < 0){
-                fprintf(stderr, "error_ swr_convert()\n");
-                exit(1);
-            }
+struct LockedFrame {
+    int id;
+    AVFrame* audio_frame = 0;
+    uint8_t* audio_buffer = 0;
+    size_t audio_buffer_size = 0;
+    std::mutex* mtx;
+    LockedFrame *next = 0;
+    int got_samples = 0;
+};
 
-            // Play sounds until samples from packet run dry
-            while(got_samples > 0){
-                int audio_buffer_size = av_samples_get_buffer_size(NULL, out_channels, got_samples, AV_SAMPLE_FMT_S16, 1);
-                ao_play(device, (char*)audio_buffer, audio_buffer_size);
+void playSound(LockedFrame* frame){
+    init_lock.lock();
+    init_lock.unlock();
 
-                got_samples = swr_convert(swr_ctx, &audio_buffer, out_samples, NULL, 0);
-                if(got_samples < 0){
-                    fprintf(stderr, "error: swr_convert()\n");
-                    exit(1);
-                }
-            }
+    pthread_setname_np(pthread_self(), "audio");
 
-
-            audio_ready = true;
+    while(frame->got_samples >= 0){
+        frame->mtx->lock();
+        if(Pa_IsStreamStopped(paStream)){
+            std::unique_lock<std::mutex> lk(ca_m);
+            cv.wait(lk, []{return true;});
         }
+
+        // for non-planar audio we could just as well use
+        // frame->audio_frame->linesize[0], but this might be a bit more clear
+        err = Pa_WriteStream(paStream, frame->audio_frame->data[0], frame->audio_frame->nb_samples);
+        if(err != paNoError){
+            std::cerr << "Failed writing to stream" << std::endl;
+            std::cerr << Pa_GetErrorText(err) << std::endl;
+
+            if(err != paOutputUnderflowed)
+                exit(1);
+        }
+
+        frame->mtx->unlock();
+        frame = frame->next;
+
+        if(done)
+            break;
     }
-    av_frame_free(&laudio_frame);
 }
 
-void renderImage(int w, int h, int imgwidth, int imgheight){
+int conv(u_char c){
+    if(c < 48)
+        return 0;
+    if(c < 114)
+        return 1;
+    return ((c - 35)/40);
+}
+
+int rgb2xterm(u_char r, u_char g, u_char b){
+    int xr, xg, xb;
+
+    xr = conv(r);
+    xg = conv(g);
+    xb = conv(b);
+
+    return 16 + (36 * xr) + (6 * xg) + xb;
+}
+
+void renderImage(int w, int h, int imgwidth, int imgheight, AVFrame* pFrame){
     int widthsize = imgwidth / w;
     int heightsize = imgheight / h;
 
+    pthread_setname_np(pthread_self(), "video");
+
     while(!done){
+        video_lock.lock(); 
+
+        avcodec_receive_frame(video_codec_ctx, pFrame);
+
+        // Convert the image from its native format to RGB
+        sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
+                pFrame->linesize, 0, imgheight,
+                pFrameRGB->data, pFrameRGB->linesize);
+
+        video_lock.unlock();
+
+        std::unique_lock<std::mutex> lk(cv_m);
+        cv.wait(lk, []{return true;});
+
         w = tb_width();
         h = tb_height();
         widthsize = imgwidth / w;
@@ -97,14 +136,19 @@ void renderImage(int w, int h, int imgwidth, int imgheight){
                 int vi = 3*(i + 1)*imgwidth + j*widthsize;
                 int vj = 3*i*imgwidth + j*widthsize;
                 tb_truecolor fg = {
-                    pixels[vi],
-                    pixels[vi + 1],
-                    pixels[vi + 2]};
+                    pFrameRGB->data[0][vi],
+                    pFrameRGB->data[0][vi + 1],
+                    pFrameRGB->data[0][vi + 2]};
                 tb_truecolor bg = {
-                    pixels[vj],
-                    pixels[vj + 1],
-                    pixels[vj + 2] };
-                tb_change_cell(y, x, L'\u2584', 0, 0, fg, bg);
+                    pFrameRGB->data[0][vj],
+                    pFrameRGB->data[0][vj + 1],
+                    pFrameRGB->data[0][vj + 2]};
+
+                // Approximate xterm values
+                uint16_t r_fg = rgb2xterm(fg.r, fg.g, fg.b);
+                uint16_t r_bg = rgb2xterm(bg.r, bg.g, bg.b);
+
+                tb_change_cell(y, x, L'\u2584', r_fg, r_bg, fg, bg);
 
                 j += 3;
             }
@@ -114,10 +158,6 @@ void renderImage(int w, int h, int imgwidth, int imgheight){
         tb_present();
     }
 
-}
-// ffmpeg probably has a similar function built in, but I couldn't find it.
-double get_fps(AVCodecContext *avctx){
-    return 1.0 / av_q2d(avctx->time_base) / FFMAX(avctx->ticks_per_frame, 1);
 }
 
 //TODO: add error checking
@@ -137,45 +177,51 @@ int main(int argc, char *argv[]) {
     // Termbox doesn't play well with outputting to std(in|err)
     av_log_set_level(AV_LOG_QUIET);
 
-
     // Initalizing these to NULL prevents segfaults
     AVFormatContext   *pFormatCtx = NULL;
     int               videoStream, audioStream;
     AVCodecContext    *pCodecCtxOrig = NULL;
     AVCodecContext    *pCodecCtx = NULL;
-    AVCodec           *pCodec = NULL;
     AVFrame           *pFrame = NULL;
-    AVFrame           *pFrameRGB = NULL;
 
     AVPacket          packet;
-        const int         max_audio_buffer_size = av_samples_get_buffer_size(NULL, out_channels, out_samples, AV_SAMPLE_FMT_S16, 1);
     int               numBytes;
-    double            deltaFrameTime = 0.0;
     int               width;
     int               height;
     uint8_t           *buffer = NULL;
     tb_event*         key_event = (tb_event*)malloc(sizeof(tb_event));
-    struct SwsContext *sws_ctx = NULL;
 
-    // Initialize audio player
-    ao_initialize();
+    LockedFrame* frame1 = (LockedFrame*)calloc(1, sizeof(LockedFrame));
+    LockedFrame* frame2 = (LockedFrame*)calloc(1, sizeof(LockedFrame));
+    LockedFrame* frame3 = (LockedFrame*)calloc(1, sizeof(LockedFrame));
 
-    int default_driver = ao_default_driver_id();
-    ao_sample_format format;
+    frame1->audio_frame = av_frame_alloc();
+    frame2->audio_frame = av_frame_alloc();
+    frame3->audio_frame = av_frame_alloc();
 
-    memset(&format, 0, sizeof(format));
-    format.bits = 16;
-    format.channels = out_channels;
-    format.rate = sample_rate;
-    format.byte_format = AO_FMT_NATIVE;
-    format.matrix = (char*)"L,R"; // Front left and front right
+    frame1->id = 1;
+    frame2->id = 2;
+    frame3->id = 3;
 
-    device = ao_open_live(default_driver, &format, NULL);
+    frame1->next = frame2;
+    frame2->next = frame3;
+    frame3->next = frame1;
+
+    frame1->mtx = new std::mutex;
+    frame2->mtx = new std::mutex;
+    frame3->mtx = new std::mutex;
 
     if(argc < 2) {
         printf("Please provide a movie file\n");
         return -1;
     }
+
+    err = Pa_Initialize();
+    if(err != paNoError){
+        std::cout << "Failed initializing PA" << std::endl;
+        exit(1);
+    }
+
     // Rather primitive and POSIX-dependent, but I wanted to try out pipes.
     // Sue me.
     std::string command = "stty size";
@@ -192,7 +238,8 @@ int main(int argc, char *argv[]) {
     pclose(pipe);
     parseWH(result, width, height);
 
-    // Register all formats and codecs
+    // Alloc format context
+    pFormatCtx = avformat_alloc_context();
 
     // Open video file
     if(avformat_open_input(&pFormatCtx, argv[1], NULL, NULL)!=0)
@@ -202,37 +249,42 @@ int main(int argc, char *argv[]) {
     if(avformat_find_stream_info(pFormatCtx, NULL)<0)
         return -1; // Couldn't find stream information
 
-    // Find the audio/video streams
-    videoStream=-1;
-    audioStream=-1;
-    for(unsigned int i = 0; i<pFormatCtx->nb_streams; i++){
-        if(pFormatCtx->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_VIDEO && videoStream < 0) {
-            videoStream=i;
-        }
+    // Allocate audio codec and find the best stream
+    AVCodec* audioCodec;
+    if((audioStream = av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, &audioCodec, 0)) < 0)
+        return -1;
 
-        if(pFormatCtx->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_AUDIO && audioStream < 0){
-            audioStream=i;
-        }
-    }
-    if(videoStream==-1)
-        return -1; // Didn't find a video stream
-    if(audioStream==-1)
-        return -1; // Didn't find an audio stream
-
-    // Allocate audio context and find decoder
-    AVCodecContext* audio_codec_ctx = avcodec_alloc_context3(NULL);
+    AVCodecContext* audio_codec_ctx = avcodec_alloc_context3(audioCodec);
     avcodec_parameters_to_context(audio_codec_ctx, pFormatCtx->streams[audioStream]->codecpar);
-    if(audio_codec_ctx->channel_layout == 0){
-        audio_codec_ctx->channel_layout = AV_CH_FRONT_LEFT | AV_CH_FRONT_LEFT;
-    }
-
-    AVCodec* audioCodec = avcodec_find_decoder(audio_codec_ctx->codec_id);
-    if(!audioCodec){
-        fprintf(stderr, "error: audio avcodec_find_decoder()\n");
-    }
 
     if(avcodec_open2(audio_codec_ctx, audioCodec, NULL) < 0){
         fprintf(stderr, "error: avcodec_open2()\n");
+        exit(1);
+    }
+
+    outputParameters.device = Pa_GetDefaultOutputDevice();
+    if(outputParameters.device == paNoDevice){
+        std::cerr << "No default output device" << std::endl;
+        exit(1);
+    }
+
+    outputParameters.channelCount = audio_codec_ctx->channels;
+    outputParameters.sampleFormat = paInt16;
+    outputParameters.suggestedLatency = 0.050;
+    outputParameters.hostApiSpecificStreamInfo = NULL;
+
+    err = Pa_OpenStream(&paStream,
+            NULL,
+            &outputParameters,
+            audio_codec_ctx->sample_rate,
+            // Random value large enough?
+            1024,
+            paClipOff,
+            NULL,
+            NULL);
+
+    if(err != paNoError){
+        std::cerr << "Failed opening PA stream" << std::endl;
         exit(1);
     }
 
@@ -241,7 +293,7 @@ int main(int argc, char *argv[]) {
         swr_alloc_set_opts(NULL,
                 AV_CH_FRONT_LEFT | AV_CH_FRONT_RIGHT,
                 AV_SAMPLE_FMT_S16,
-                sample_rate,
+                audio_codec_ctx->sample_rate,
                 audio_codec_ctx->channel_layout,
                 audio_codec_ctx->sample_fmt,
                 audio_codec_ctx->sample_rate,
@@ -253,37 +305,28 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    // Initiate termbox for drawing to the screen. USE MY FORK, MUY IMPORTANTE!
-    tb_select_output_mode(TB_OUTPUT_TRUECOLOR);
+    // Initiate termbox for drawing to the screen. My fork is needed.
+    if(argc == 2){
+        tb_select_output_mode(TB_OUTPUT_256);
+    } else {
+        tb_select_output_mode(TB_OUTPUT_TRUECOLOR);
+    }
     tb_init();
 
     // Initiate resampling context
     swr_init(swr_ctx);
-    // Get a pointer to the codec context for the video stream
-    pCodecCtxOrig=avcodec_alloc_context3(NULL);
-    // Contexts can't be directly transferred anymore, a temporary container is
-    // needed. I think.
-    AVCodecParameters* tempparams = avcodec_parameters_alloc();
-    avcodec_parameters_to_context(pCodecCtxOrig, pFormatCtx->streams[videoStream]->codecpar);
-    // Find the decoder for the video stream
-    pCodec=avcodec_find_decoder(pCodecCtxOrig->codec_id);
-    if(pCodec==NULL) {
-        fprintf(stderr, "Unsupported codec!\n");
-        return -1; // Codec not found
-    }
-    // Copy context
-    pCodecCtx = avcodec_alloc_context3(pCodec);
-    avcodec_parameters_from_context(tempparams, pCodecCtxOrig);
-    if(avcodec_parameters_to_context(pCodecCtx, tempparams) != 0){
-        fprintf(stderr, "Couldn't copy codec context");
-        return -1; // Error copying codec context
-    }
 
-    // Open codec
-    if(avcodec_open2(pCodecCtx, pCodec, NULL)<0)
+    AVCodec* videoCodec;
+    if((videoStream = av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &videoCodec, 0)) < 0)
+        return -1;
+
+    video_codec_ctx = avcodec_alloc_context3(videoCodec);
+    avcodec_parameters_to_context(video_codec_ctx, pFormatCtx->streams[videoStream]->codecpar);
+
+    // Open video codec
+    if(avcodec_open2(video_codec_ctx, videoCodec, NULL)<0)
         return -1; // Could not open codec
 
-    deltaFrameTime = 1 / get_fps(pCodecCtx);
     // Allocate video frame
     pFrame=av_frame_alloc();
 
@@ -292,12 +335,7 @@ int main(int argc, char *argv[]) {
     if(pFrameRGB==NULL)
         return -1;
 
-    // Allocate audio frame
-    audio_frame = av_frame_alloc();
-    // Allocate the audio buffer that we'll use to pass data to AO
-    audio_buffer = (uint8_t*)av_malloc(max_audio_buffer_size);
-
-    numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height, 1);
+    numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_codec_ctx->width, video_codec_ctx->height, 1);
     //pCodecCtx->height);
     buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
     pixels=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
@@ -305,14 +343,14 @@ int main(int argc, char *argv[]) {
     // Assign appropriate parts of buffer to image planes in pFrameRGB
     // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
     // of AVPicture
-    av_image_fill_arrays(pFrameRGB->data, pFrameRGB->linesize, buffer, AV_PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height, 1);    // Where the fuck is alignment defined? Someone told me to just use 1, seems to work
+    av_image_fill_arrays(pFrameRGB->data, pFrameRGB->linesize, buffer, AV_PIX_FMT_RGB24, video_codec_ctx->width, video_codec_ctx->height, 1);    // Where the fuck is alignment defined? Someone told me to just use 1, seems to work
 
     // Initialize SWS context for software scaling
-    sws_ctx = sws_getContext(pCodecCtx->width,
-            pCodecCtx->height,
-            pCodecCtx->pix_fmt,
-            pCodecCtx->width,
-            pCodecCtx->height,
+    sws_ctx = sws_getContext(video_codec_ctx->width,
+            video_codec_ctx->height,
+            video_codec_ctx->pix_fmt,
+            video_codec_ctx->width,
+            video_codec_ctx->height,
             AV_PIX_FMT_RGB24,
             SWS_BILINEAR,
             NULL,
@@ -320,11 +358,28 @@ int main(int argc, char *argv[]) {
             NULL
             );
 
+    LockedFrame *frame = frame1;
+    init_lock.lock();
+
     // Initiate new thread for drawing the image
-    std::thread trd(renderImage, width, height, pCodecCtx->width, pCodecCtx->height);
-    std::thread aud(playSound);
+    std::thread trd(renderImage, width, height, video_codec_ctx->width, video_codec_ctx->height, pFrame);
+    std::thread aud(playSound, frame);
+
+    av_init_packet(&packet);
+    packet.data = NULL;
+    packet.size = 0;
+
+    AVFrame* output = av_frame_alloc();
+
+    err = Pa_StartStream(paStream);
+    if(err != paNoError){
+        std::cerr << "Failed starting stream" << std::endl;
+        exit(1);
+    }
 
     // Main loop
+    int frames = 0;
+    int ret = 0;
     while(av_read_frame(pFormatCtx, &packet)>=0) {
 
         // If user presses ESC or Q, quit
@@ -334,59 +389,93 @@ int main(int argc, char *argv[]) {
 
         // Is this a packet from the video stream?
         if(packet.stream_index == videoStream) {
+            video_lock.lock();
             // Decode video frame
-            avcodec_send_packet(pCodecCtx, &packet);
-            avcodec_receive_frame(pCodecCtx, pFrame);
+            avcodec_send_packet(video_codec_ctx, &packet);
+            video_lock.unlock();
 
-            // Convert the image from its native format to RGB
-            sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
-                    pFrame->linesize, 0, pCodecCtx->height,
-                    pFrameRGB->data, pFrameRGB->linesize);
-
-            memcpy((uint8_t*)pixels, (uint8_t*)*pFrameRGB->data, frame_width*frame_height*3);
-            frame_width = pCodecCtx->width;
-            frame_height = pCodecCtx->height;
-
+            cv.notify_all();
         }
+
         if(packet.stream_index == audioStream){
             // Decode packet
+
+            frame->mtx->lock();
             avcodec_send_packet(audio_codec_ctx, &packet);
-            avcodec_receive_frame(audio_codec_ctx, audio_frame);
 
-            audio_decode_ready = true;
-            while(!audio_ready){
-                continue;
+            avcodec_receive_frame(audio_codec_ctx, output);
+            //frame->audio_frame->nb_samples = output->nb_samples;
+
+            if(frame->audio_frame->nb_samples != output->nb_samples){
+                av_frame_unref(frame->audio_frame);
+
+                // get new buffers and stuff
+                frame->audio_frame->format = AV_SAMPLE_FMT_S16;
+                frame->audio_frame->channels = output->channels;
+                frame->audio_frame->channel_layout = output->channel_layout;
+                frame->audio_frame->nb_samples = output->nb_samples;
+
+                ret = av_frame_get_buffer(frame->audio_frame, 32);
+                if(ret < 0){
+                    std::cerr << "failed getting new buffer" << std::endl;
+                    exit(1);
+                }
+
+                if(frames != output->nb_samples){
+
+                    err = Pa_StopStream(paStream);
+                    if(err != paNoError){
+                        std::cerr << "Failed stopping PA stream after update" << std::endl;
+                        exit(1);
+                    }
+
+                    err = Pa_OpenStream(&paStream,
+                            NULL,
+                            &outputParameters,
+                            audio_codec_ctx->sample_rate,
+                            output->nb_samples,
+                            paClipOff,
+                            NULL,
+                            NULL);
+                    if(err != paNoError){
+                        std::cerr << "Failed opening PA stream after update" << std::endl;
+                        exit(1);
+                    }
+
+                    err = Pa_StartStream(paStream);
+                    if(err != paNoError){
+                        std::cerr << "Failed starting PA stream after update" << std::endl;
+                        exit(1);
+                    }
+                    std::cout << "notified lol" << std::endl;
+                    ca.notify_all();
+                    frames = output->nb_samples;
+                }
+
             }
-            audio_ready = false;
-
-
-
-
-            /*int got_samples = swr_convert(
+            // we should get all samples because our buffer should be large
+            // enough, hopefully
+            frame->got_samples = swr_convert(
                     swr_ctx,
-                    &audio_buffer, out_samples,
-                    (const uint8_t **)audio_frame->data, audio_frame->nb_samples);
+                    frame->audio_frame->data, frame->audio_frame->nb_samples,
+                    (const uint8_t **)output->data, output->nb_samples
+                    );
 
-            if(got_samples < 0){
-                fprintf(stderr, "error_ swr_convert()\n");
+            if(frame->got_samples < 0){
+                std::cerr << "error: swr_convert" << std::endl;
                 exit(1);
             }
 
-            // Play sounds until samples from packet run dry
-            while(got_samples > 0){
-                int audio_buffer_size = av_samples_get_buffer_size(NULL, out_channels, got_samples, AV_SAMPLE_FMT_S16, 1);
-                AVPacket pock;
-                av_init_packet(&pock);
-                pock.data =  audio_buffer;
-                pock.size = audio_buffer_size;
-                ao_play(device, (char*)pock.data, pock.size);
+            frame->audio_buffer_size = av_samples_get_buffer_size(NULL,
+                    frame->audio_frame->channels,
+                    frame->audio_frame->nb_samples,
+                    AV_SAMPLE_FMT_S16, 32);
 
-                got_samples = swr_convert(swr_ctx, &audio_buffer, out_samples, NULL, 0);
-                if(got_samples < 0){
-                    fprintf(stderr, "error: swr_convert()\n");
-                    exit(1);
-                }
-            }*/
+            frame->mtx->unlock();
+
+            frame = frame->next;
+            init_lock.unlock();
+
         }
         // Free the packet that was allocated by av_read_frame
         av_packet_unref(&packet);
@@ -397,8 +486,17 @@ int main(int argc, char *argv[]) {
     aud.join();
 
     // Free everything
-    ao_close(device);
-    ao_shutdown();
+    err = Pa_StopStream(paStream);
+    if(err != paNoError){
+        std::cerr << "Failed stopping PA stream in cleanup" << std::endl;
+        exit(1);
+    }
+    err = Pa_CloseStream(paStream);
+    if(err != paNoError){
+        std::cerr << "Failed closing PA stream in cleanup" << std::endl;
+        exit(1);
+    }
+    Pa_Terminate();
     tb_shutdown();
 
 
@@ -406,17 +504,14 @@ int main(int argc, char *argv[]) {
     sws_freeContext(sws_ctx);
     av_free(buffer);
     av_free(pixels);
-    av_free(audio_buffer);
     av_frame_free(&pFrameRGB);
     av_frame_free(&pFrame);
-    av_frame_free(&audio_frame);
     avcodec_close(pCodecCtx);
     avcodec_close(pCodecCtxOrig);
     avcodec_free_context(&pCodecCtx);
     avcodec_close(audio_codec_ctx);
     avcodec_free_context(&audio_codec_ctx);
     avcodec_free_context(&pCodecCtxOrig);
-    avcodec_parameters_free(&tempparams);
     avformat_close_input(&pFormatCtx);
     free(key_event);
 

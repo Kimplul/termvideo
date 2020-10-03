@@ -18,12 +18,19 @@ I've included a simple makefile, just write ```make``` in the same directory and
 Type ```./vtview PATH/TO/VIDEO```. Press ```ESC``` or ```Q``` to exit once the video is playing.
 
 # TODO/Flaws/etc.
-+ Audio is a bit choppy. Some kind of queuing mechanism should be added but that'd need a somewhat sizeable rewrite. Might do it in the future.
 + The video's height and width should be larger than the terminal's. If the terminal is larger, you get some undefined behaviour.
-+ Libao might be muted on some systems, change ```/etc/libao.conf``` to fix. Remove ```muted``` if present, and change default driver if necessary.
-+ Probably lots of other stuff, but hey, first time using libav, I'm still hecking proud.
++ Slight overflow in certain videos, particularly letterboxed ones for some reason.
+
+# Improvements made this year:
++ Changed rendering and audio playback. More work is now done in separate
+  threads. In addition to that, I switched to PortAudio, libao caused stuttering
+  and weird unwanted effects.
++ By default 256-color mode is selected, if you want to use truecolor give the
+  command a third argument. For now it can be whatever, i.e. "./vtview VIDEO
+  lol"
 
 # Thanks
 + [https://github.com/leandromoreira/ffmpeg-libav-tutorial](https://github.com/leandromoreira/ffmpeg-libav-tutorial)
 + [Steven Dranger's "How to write a video player in less than 1000 lines"](dranger.com/ffmpeg/)
++ PortAudio as a whole
 

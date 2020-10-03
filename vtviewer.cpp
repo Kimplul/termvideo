@@ -61,6 +61,8 @@ void playSound(LockedFrame* frame){
 
     while(frame->got_samples >= 0){
         frame->mtx->lock();
+
+
         if(Pa_IsStreamStopped(paStream)){
             std::unique_lock<std::mutex> lk(ca_m);
             cv.wait(lk, []{return true;});
@@ -73,6 +75,12 @@ void playSound(LockedFrame* frame){
             std::cerr << "Failed writing to stream" << std::endl;
             std::cerr << Pa_GetErrorText(err) << std::endl;
 
+            // this error seems to be triggered when the stream is stopped at
+            // the end of a song, strange
+            /*if(err == paUnanticipatedHostError)
+                break;*/
+
+            // underflow is alright, shouldn't cause any issues
             if(err != paOutputUnderflowed)
                 exit(1);
         }
@@ -423,11 +431,11 @@ int main(int argc, char *argv[]) {
 
                 if(frames != output->nb_samples){
 
-                    err = Pa_StopStream(paStream);
+                    /*err = Pa_StopStream(paStream);
                     if(err != paNoError){
                         std::cerr << "Failed stopping PA stream after update" << std::endl;
                         exit(1);
-                    }
+                    }*/
 
                     err = Pa_OpenStream(&paStream,
                             NULL,
@@ -447,7 +455,7 @@ int main(int argc, char *argv[]) {
                         std::cerr << "Failed starting PA stream after update" << std::endl;
                         exit(1);
                     }
-                    std::cout << "notified lol" << std::endl;
+
                     ca.notify_all();
                     frames = output->nb_samples;
                 }
@@ -480,17 +488,15 @@ int main(int argc, char *argv[]) {
         // Free the packet that was allocated by av_read_frame
         av_packet_unref(&packet);
     }
-    // Tell other thread to stop rendering
+    //Pa_StopStream(paStream);
+    // Tell other threads to stop
+    frame->got_samples = -1;
     done = true;
-    trd.join();
+
     aud.join();
+    trd.join();
 
     // Free everything
-    err = Pa_StopStream(paStream);
-    if(err != paNoError){
-        std::cerr << "Failed stopping PA stream in cleanup" << std::endl;
-        exit(1);
-    }
     err = Pa_CloseStream(paStream);
     if(err != paNoError){
         std::cerr << "Failed closing PA stream in cleanup" << std::endl;
